@@ -154,6 +154,23 @@ def inject_css() -> None:
           ) !important;
         }
 
+        /* Make st.link_button match your button style */
+        a[data-testid="stLinkButton"] > button {
+          border-radius: 10px !important;
+          padding: 0.62rem 0.85rem !important;
+          font-weight: 820 !important;
+          border: 1px solid var(--stroke) !important;
+          background: color-mix(in srgb, var(--card) 96%, transparent) !important;
+          color: var(--fg) !important;
+          transition: border-color 110ms ease, background 110ms ease, transform 120ms ease;
+          box-shadow: none !important;
+        }
+        a[data-testid="stLinkButton"] > button:hover {
+          border-color: color-mix(in srgb, var(--accent) 45%, transparent) !important;
+          background: color-mix(in srgb, var(--accent) 6%, var(--card)) !important;
+          transform: translateY(-1px);
+        }
+
         .filing-title a{
           font-weight: 920;
           font-size: 1.06rem;
@@ -223,15 +240,6 @@ def inject_css() -> None:
           line-height: 1.25rem;
         }
 
-        .company-link{
-          display:block;
-          text-decoration:none !important;
-          color: var(--fg) !important;
-        }
-        .company-link:hover .panel{
-          border-color: color-mix(in srgb, var(--accent2) 45%, transparent);
-          background: color-mix(in srgb, var(--accent2) 4%, var(--card));
-        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -240,6 +248,8 @@ def inject_css() -> None:
 
 # -------------------- Networking (SEC headers + retry) --------------------
 def _sec_contact() -> str:
+    # Prefer Streamlit secrets, fallback to env var.
+    # IMPORTANT: Set SEC_CONTACT_EMAIL in Streamlit Cloud secrets.
     try:
         contact = st.secrets.get("SEC_CONTACT_EMAIL", None)  # type: ignore[attr-defined]
     except Exception:
@@ -267,7 +277,7 @@ def fetch_json(url: str) -> Any:
             return r.json()
         except Exception as e:
             last_err = e
-            time.sleep(0.6 * (attempt + 1))
+            time.sleep(0.6 * (attempt + 1))  # small backoff
     raise last_err if last_err else RuntimeError("Unknown error fetching JSON")
 
 
@@ -313,7 +323,7 @@ def get_ticker_cik_map() -> Dict[str, int]:
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_company_submissions(cik_int: int) -> Dict[str, Any]:
     cik_padded = f"{cik_int:010d}"
-    time.sleep(0.2)  # gentle base rate-limiting
+    time.sleep(0.2)  # gentle rate-limiting
     return fetch_json(SEC_SUBMISSIONS_URL.format(cik_padded=cik_padded))
 
 
@@ -428,6 +438,12 @@ def get_last_close_best_effort(ticker: str) -> Optional[float]:
         return None
 
 
+# -------------------- Recent News helper --------------------
+def ticker_news_url(ticker: str) -> str:
+    t = (ticker or "").strip().upper()
+    return f"https://seekingalpha.com/symbol/{t}/news"
+
+
 # -------------------- Routing via query params --------------------
 def _get_query_params() -> Dict[str, List[str]]:
     try:
@@ -462,24 +478,6 @@ def clear_all() -> None:
     st.session_state.input_key = f"ticker_input_{time.time_ns()}"
 
 
-# -------------------- (3) THROTTLE: soft, per-session rate limit --------------------
-# Goal: stop users from hammering SEC endpoints and getting 429/403.
-# - One lookup every ~1.1s (tweakable)
-# - Enforced only on submit_lookup (the place that triggers SEC calls)
-THROTTLE_SECONDS = 1.1
-
-
-def _throttle_or_block() -> Optional[str]:
-    now = time.time()
-    last = float(st.session_state.get("_last_lookup_ts", 0.0))
-    elapsed = now - last
-    if elapsed < THROTTLE_SECONDS:
-        wait = THROTTLE_SECONDS - elapsed
-        return f"Please wait {wait:.1f}s and try again (rate limit)."
-    st.session_state["_last_lookup_ts"] = now
-    return None
-
-
 # --- Progress UI pinned under LEFT panel buttons ---
 def init_lookup_progress_slots() -> None:
     if "lookup_progress_bar" not in st.session_state:
@@ -509,46 +507,20 @@ def _progress_clear() -> None:
         pass
 
 
-def _friendly_sec_error(e: Exception) -> str:
-    s = str(e)
-    code = None
-    if isinstance(e, requests.HTTPError):
-        try:
-            code = e.response.status_code  # type: ignore[union-attr]
-        except Exception:
-            code = None
-    if code in (403, 429):
-        return (
-            "SEC temporarily blocked or rate-limited requests.\n\n"
-            "- Wait 30–60 seconds and try again.\n"
-            "- Make sure SEC_CONTACT_EMAIL is set in Streamlit Secrets.\n"
-            "- Avoid rapid repeated lookups."
-        )
-    if code and 500 <= code <= 599:
-        return "SEC server error. Try again in a minute."
-    if "timeout" in s.lower():
-        return "Request timed out. Try again."
-    return f"Request failed: {s}"
-
-
 def submit_lookup() -> None:
     ticker = (st.session_state.get("ticker_value", "") or "").strip().upper()
     if not ticker:
         st.session_state.results = {"error": "Enter a ticker."}
         return
 
-    # (3) apply throttle BEFORE any calls
-    throttle_msg = _throttle_or_block()
-    if throttle_msg:
-        st.session_state.results = {"error": throttle_msg}
-        return
-
+    # Ensure placeholders exist even when Enter key triggers submit
     if "lookup_progress_bar" not in st.session_state or "lookup_progress_status" not in st.session_state:
         st.session_state.lookup_progress_bar = st.empty()
         st.session_state.lookup_progress_status = st.empty()
 
     try:
         _progress_set(10, "Starting lookup…")
+
         _progress_set(20, "Loading SEC ticker→CIK map…")
         mapping = get_ticker_cik_map()
 
@@ -566,10 +538,10 @@ def submit_lookup() -> None:
 
         _progress_set(100, "Done")
         time.sleep(0.15)
-
+    except requests.HTTPError as e:
+        st.session_state.results = {"error": f"SEC request failed: {e}"}
     except Exception as e:
-        st.session_state.results = {"error": _friendly_sec_error(e)}
-
+        st.session_state.results = {"error": f"Unexpected error: {e}"}
     finally:
         _progress_clear()
 
@@ -752,24 +724,30 @@ def page_lookup() -> None:
         last_close = get_last_close_best_effort(r["ticker"])
         price_line = f"${last_close:,.2f}" if last_close is not None else "N/A"
 
+        # Company header panel
         st.markdown(
             f"""
-            <a class="company-link" href="{r['browse_url']}" target="_blank">
-              <div class="panel">
-                <div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-                  <div style="font-size:1.20rem; font-weight:980;">{r['company_name']}</div>
-                  <div class="muted2">{r['ticker']} · CIK {r['cik']}</div>
-                </div>
-                <div class="divider"></div>
-                <div style="display:flex; gap:10px; align-items:baseline; flex-wrap:wrap;">
-                  <div class="muted">Last close</div>
-                  <div style="font-weight:950;">{price_line}</div>
-                </div>
+            <div class="panel">
+              <div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+                <div style="font-size:1.20rem; font-weight:980;">{r['company_name']}</div>
+                <div class="muted2">{r['ticker']} · CIK {r['cik']}</div>
               </div>
-            </a>
+              <div class="divider"></div>
+              <div style="display:flex; gap:10px; align-items:baseline; flex-wrap:wrap;">
+                <div class="muted">Last close</div>
+                <div style="font-weight:950;">{price_line}</div>
+              </div>
+            </div>
             """,
             unsafe_allow_html=True,
         )
+
+        # Action buttons (SEC company page + Recent news)
+        b1, b2 = st.columns([1, 1], gap="small")
+        with b1:
+            st.link_button("SEC company page", r["browse_url"], use_container_width=True)
+        with b2:
+            st.link_button("Recent news", ticker_news_url(r["ticker"]), use_container_width=True)
 
         with st.expander("Form glossary", expanded=False):
             for k, v in FORM_GLOSSARY.items():
@@ -928,6 +906,12 @@ What to focus on:
 - MD&A (the “why” behind the numbers)
 - Financial statements + notes (debt, leases, contingencies)
 - Cash flow quality (operating cash flow vs net income)
+
+Quick checks:
+- Revenue growth vs margins
+- Debt maturity schedule/refinancing risk
+- Concentration risk (customers/suppliers)
+- Share count + SBC trend
         """.strip(),
     )
 
@@ -938,6 +922,12 @@ What to focus on:
 - What changed since the last 10-K (margins, demand, pricing)
 - Liquidity (cash, revolver use, working capital)
 - Guidance / outlook language
+- Dilution (share count, SBC, buybacks)
+
+Quick checks:
+- Quarter vs prior quarter and vs same quarter last year
+- “Non-recurring” adjustments that repeat
+- New legal/regulatory notes
         """.strip(),
     )
 
@@ -948,6 +938,10 @@ What to focus on:
 - Deals & acquisitions (terms, conditions, financing)
 - Leadership changes
 - Financing updates (debt/equity, credit agreements)
+- Earnings releases often live in exhibits
+
+Pro move:
+- Read the Exhibits. That’s usually where the real detail is.
         """.strip(),
     )
 
@@ -958,6 +952,12 @@ What to focus on:
 - Executive compensation (what management is paid to do)
 - Governance (board independence, voting structure, rights)
 - Related-party transactions (conflicts)
+- Shareholder proposals (what’s being voted on and why)
+
+Quick checks:
+- Pay-for-performance alignment
+- Dilution from equity plans
+- Control structures (dual-class / insider power)
         """.strip(),
     )
 
@@ -968,6 +968,8 @@ What to focus on:
 - Business overview and geographic exposure
 - Risk factors (currency, regulatory, geopolitical)
 - Reconciliation to U.S. GAAP (if applicable)
+- Cash flow sustainability
+- Government or state influence (if disclosed)
         """.strip(),
     )
 
@@ -978,6 +980,7 @@ What to focus on:
 - Material updates between annual reports
 - Earnings releases and operational updates
 - Strategic partnerships or restructurings
+- Management commentary not found elsewhere
         """.strip(),
     )
 
@@ -1050,4 +1053,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
